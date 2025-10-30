@@ -75,7 +75,7 @@ class AdSpot:
         pos (list[float]): Expected position scores per slot. 
     """
 
-    def __init__(self, num_slots: int, tags: List[str], pos: Optional[List[float]] = None):
+    def __init__(self, num_slots: int, tags: List[str], pos: Optional[List[float]] = None, mechanism: str="efficiency-max"):
         """Initialize an AdSpot.
 
         Args:
@@ -101,6 +101,8 @@ class AdSpot:
                 raise ValueError("pos values must be between 0 and 1")
             self.pos = list(pos)
 
+        self.mechanism = mechanism
+
     def assign(
         self,
         bidders: List[Bidder],
@@ -116,9 +118,11 @@ class AdSpot:
             valuation_fn (Callable): Function (bidder, adspot, ctrs) -> valuation.
 
         Returns:
-            dict[str, list]: A dictionary with keys:
+            dict[str, list | dict]: A dictionary with keys:
                 - 'winners': list of winning bidders (or None if no bids)
                 - 'prices': list of clearing prices per slot
+                - 'qualities': mapping of bidder name -> quality score used for this impression
+                - 'slot_positions': copy of the slot position multipliers for the adspot
 
         Raises:
             ValueError: If `valuation_fn` is not provided or `method` unknown.
@@ -159,7 +163,8 @@ class AdSpot:
         # Sort descending by bid, breaking ties randomly for fairness.
         def sort_key(item: Tuple[Bidder, float, float, float]):
             bidder, val, bid_amt, quality = item
-            return (bid_amt * quality, random.random())
+            if self.mechanism == "efficiency-max":
+                return (bid_amt * quality, random.random())
         eligible_sorted = sorted(eligible, key=sort_key, reverse=True)
 
         ###############################################
@@ -195,7 +200,14 @@ class AdSpot:
         ###############################################
 
 
-        return {"winners": winners, "prices": prices}
+        result = {
+            "winners": winners,
+            "prices": prices,
+            "qualities": {b.name: q for b, q in zip(bidders, Qs)},
+            "slot_positions": list(self.pos),
+        }
+
+        return result
 
 
 class Platform:
@@ -214,6 +226,7 @@ class Platform:
         adspots: List[AdSpot],
         method: str = "second_price",
         valuation_fn: Optional[Callable[[Bidder, AdSpot, List[float]], float]] = None,
+        quality_fn: Optional[Callable[[AdSpot, List[Bidder]], List[float]]] = None,
     ) -> List[Dict[str, List]]:
         """Run auctions for multiple adspots sequentially.
 
@@ -221,6 +234,8 @@ class Platform:
             adspots (list[AdSpot]): List of ad opportunities to allocate.
             method (str): Auction format, defaults to 'second_price'.
             valuation_fn (Callable): Function (bidder, adspot, ctrs) -> valuation.
+            quality_fn (Callable): Optional function returning quality scores per bidder
+                for a given adspot. Defaults to uniform quality of 1.0 when not provided.
 
         Returns:
             list[dict[str, list]]: Results per adspot, each with 'winners' and 'prices'.
@@ -233,13 +248,12 @@ class Platform:
 
         results = []
         for spot in adspots:
-            # Quality of ad (in reality is given by machine learning model, here we simulate it with random values)
-            # Qs = [random.uniform(0.1, 0.9) for _ in self.bidders]
-            # Qs = [1 for _ in self.bidders]
-            if spot.tags[0] == "female":
-                Qs = [1 if b.name == "STEM" else 0.5 for b in self.bidders]
+            if quality_fn is None:
+                Qs = [1.0 for _ in self.bidders]
             else:
-                Qs = [1 if b.name == "STEM" else 0.1 for b in self.bidders]
+                Qs = quality_fn(spot, self.bidders)
+                if len(Qs) != len(self.bidders):
+                    raise ValueError("quality_fn must return one quality per bidder")
 
             # Delegates the auction logic to each AdSpot instance.
             res = spot.assign(self.bidders, method=method, valuation_fn=valuation_fn, Qs=Qs)
