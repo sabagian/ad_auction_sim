@@ -75,13 +75,25 @@ class AdSpot:
         pos (list[float]): Expected position scores per slot. 
     """
 
-    def __init__(self, num_slots: int, tags: List[str], pos: Optional[List[float]] = None, mechanism: str="efficiency-max"):
+    def __init__(
+        self,
+        num_slots: int,
+        tags: List[str],
+        pos: Optional[List[float]] = None,
+        mechanism: str = "efficiency-max",
+        tie_break_config: Optional[Dict[str, float]] = None,
+    ):
         """Initialize an AdSpot.
 
         Args:
             num_slots (int): Number of available ad slots (>=1).
             tags (list[str]): Descriptive tags for the impression context.
             pos (list[float]): Expected position scores per slot. (i.e. Probability of click in that position)
+            tie_break_config (dict[str, float] | None): Optional configuration to bias
+                tie-breaking between specific bidders. Expected keys:
+                - "p_stem_female": target P(STEM | female)
+                - "stem_quality_ratio": ratio of STEM quality male/female
+                - Optional overrides: "stem_bidder", "alt_bidder", "default_bias"
 
         Raises:
             AssertionError: If `num_slots` < 1.
@@ -102,6 +114,44 @@ class AdSpot:
             self.pos = list(pos)
 
         self.mechanism = mechanism
+        self.tie_break_config: Dict[str, float] = dict(tie_break_config or {})
+
+    def _tie_break_bias(self, bidder_name: str, group: Optional[str]) -> Optional[float]:
+        """Return tie-break probability for the bidder if configured."""
+        if not self.tie_break_config:
+            return None
+
+        cfg = self.tie_break_config
+        p_stem_female = cfg.get("p_stem_female")
+        if p_stem_female is None:
+            return cfg.get("default_bias", 0.5)
+
+        stem_name = cfg.get("stem_bidder", "STEM")
+        alt_name = cfg.get("alt_bidder", "Makeup")
+        default_bias = cfg.get("default_bias", 0.5)
+
+        p_stem_female = max(0.0, min(1.0, p_stem_female))
+
+        stem_prob: Optional[float]
+        if group == "female":
+            stem_prob = p_stem_female
+        elif group == "male":
+            ratio = cfg.get("stem_quality_ratio")
+            if ratio is None:
+                stem_prob = None
+            else:
+                stem_prob = max(0.0, min(1.0, ratio * p_stem_female))
+        else:
+            stem_prob = None
+
+        if stem_prob is None:
+            return default_bias
+
+        if bidder_name == stem_name:
+            return stem_prob
+        if bidder_name == alt_name:
+            return 1.0 - stem_prob
+        return default_bias
 
     def assign(
         self,
@@ -150,21 +200,63 @@ class AdSpot:
             val = b.valuation(self, valuation_fn, ctrs)
             if val > 0:
                 bid_amt = b.bid(self, val)
-                eligible.append((b, val, bid_amt, Qs[i]))  # (bidder, how much they value the spot, how much they bid, quality score)
+                eligible.append((b, val, bid_amt, Qs[i], 0))  # (bidder, how much they value the spot, how much they bid, quality score)
+                #last value = alpha
 
         # If no one bids positively, return empty allocation.
         if not eligible:
             return {"winners": [None] * self.num_slots, "prices": [0.0] * self.num_slots}
+        
+        # print(eligible)
+        if self.mechanism != 'efficiency-max' and self.tags[0]=='female':
+            # Placeholder for future fairness-constrained allocation logic.
+            for i in range(len(eligible)):
+                bidder, val, bid_amt, quality, _ = eligible[i]
+                if bidder.name == 'Makeup':
+                    delta = bid_amt * quality
+            for i in range(len(eligible)):
+                bidder, val, bid_amt, quality, _ = eligible[i]
+                if bidder.name == 'STEM':
+                    alpha = delta - bid_amt * quality
+                    # print("alpha STEM women:", alpha)
+                    eligible[i] = (bidder, val, bid_amt, quality, alpha)
 
+        if self.mechanism != 'efficiency-max' and self.tags[0]=='male':
+            # Placeholder for future fairness-constrained allocation logic.
+            for i in range(len(eligible)):
+                bidder, val, bid_amt, quality, _ = eligible[i]
+                if bidder.name == 'STEM':
+                    delta = bid_amt * quality
+            for i in range(len(eligible)):
+                bidder, val, bid_amt, quality, _ = eligible[i]
+                if bidder.name == 'Makeup':
+                    alpha = delta - bid_amt * quality
+                    eligible[i] = (bidder, val, bid_amt, quality, alpha)
+            
 
+        # print(eligible)
         # Here you can change how winners are determined, here is the classic rank-by-expected-value (bid * quality)
         ###############################################
 
-        # Sort descending by bid, breaking ties randomly for fairness.
-        def sort_key(item: Tuple[Bidder, float, float, float]):
-            bidder, val, bid_amt, quality = item
+        # Sort descending by bid, optionally biasing ties via configuration.
+        def sort_key(item: Tuple[Bidder, float, float, float, float]):
+            bidder, val, bid_amt, quality, alpha = item
+            group = self.tags[0] if self.tags else None
             if self.mechanism == "efficiency-max":
-                return (bid_amt * quality, random.random())
+                score = bid_amt * quality
+            else:
+                score = bid_amt * quality + alpha
+
+            if self.mechanism == 'EQ_constrained':
+                bias = self._tie_break_bias(bidder.name, group)
+            else:
+                bias = None
+            if bias is None:
+                return (score, random.random(), random.random())
+
+            tie_flag = random.random() < bias
+            return (score, tie_flag, random.random())
+
         eligible_sorted = sorted(eligible, key=sort_key, reverse=True)
 
         ###############################################
@@ -186,7 +278,7 @@ class AdSpot:
         elif method == "gsp":
             # Generalized Second Price: ordered slots with descending CTRs.
             allocated = eligible_sorted[: self.num_slots]
-            for slot_idx, (bidder, val, bid_amt, quality) in enumerate(allocated):
+            for slot_idx, (bidder, val, bid_amt, quality, alpha) in enumerate(allocated):
                 winners[slot_idx] = bidder
                 # Price is the next *overall* bidder's bid (not just among winners)
                 if slot_idx + 1 < len(eligible_sorted):

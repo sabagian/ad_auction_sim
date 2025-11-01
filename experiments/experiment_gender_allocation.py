@@ -1,6 +1,6 @@
 from collections import Counter
 import random
-from typing import Dict, Any, Callable, List, Mapping
+from typing import Dict, Any, Callable, List, Mapping, Optional
 
 from sim.ad_auction import Bidder, AdSpot, Platform
 
@@ -12,9 +12,10 @@ def _group_impressions_by_group(impressions: List[Dict[str, Any]]) -> Dict[str, 
     return grouped
 
 
-def calculate_statistical_parity(
+def calculate_fairness_metrics(
     impressions: List[Dict[str, Any]],
     positive_bidder_name: str | None = None,
+    quality_stem: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
     """Compute statistical parity using simulated impression logs.
 
@@ -36,47 +37,23 @@ def calculate_statistical_parity(
         positive_rates[group] = positives / total if total else 0.0
 
     max_gap = max(positive_rates.values()) - min(positive_rates.values()) if positive_rates else 0.0
+
+    print("quality stem:", quality_stem)
+    print("positive rates:", positive_rates)
+    positive_rates_EQ = {'male':positive_rates['male'], 
+                         'female':positive_rates['female'], 
+                         'female_adjusted': positive_rates['male'] * quality_stem.get('male', 1.0)/ quality_stem.get('female', 1.0) if quality_stem else None}
+
+    positive_rates_EQ['max_gap'] = max(positive_rates_EQ['female_adjusted'], positive_rates_EQ['female']) - min(positive_rates_EQ['female_adjusted'], positive_rates_EQ['female'])
+
+    
     return {
         "per_group": positive_rates,
         "max_gap": max_gap,
         "positive_bidder": positive_bidder_name,
+        "adjusted_rates": positive_rates_EQ,
     }
 
-
-def calculate_equality_of_opportunity(impressions: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Estimate equality of opportunity using quality as click probability proxy.
-
-    We compare the expected clicks captured by the shown ad against the total
-    expected clicks available from *all* ads for that group. This mirrors the
-    classic definition P(pred=1 | true=1), where "true" users are those who
-    would click any ad (probability mass given by the quality scores).
-    """
-    grouped = _group_impressions_by_group(impressions)
-    opportunity_rates: Dict[str, float] = {}
-
-    for group, entries in grouped.items():
-        expected_clickers_shown = 0.0
-        expected_clickers_potential = 0.0
-
-        for entry in entries:
-            qualities: Dict[str, float] = entry.get("qualities", {})
-            if not qualities:
-                continue
-
-            slot_weight = entry.get("slot_weight", 1.0)
-            potential = sum(qualities.values()) * slot_weight
-            expected_clickers_potential += potential
-
-            winner_name = entry.get("winner")
-            if winner_name is not None:
-                expected_clickers_shown += qualities.get(winner_name, 0.0) * slot_weight
-
-        opportunity_rates[group] = (
-            expected_clickers_shown / expected_clickers_potential if expected_clickers_potential else 0.0
-        )
-
-    max_gap = max(opportunity_rates.values()) - min(opportunity_rates.values()) if opportunity_rates else 0.0
-    return {"per_group": opportunity_rates, "max_gap": max_gap}
 
 
 def calculate_total_utility(impressions: List[Dict[str, Any]]) -> float:
@@ -98,6 +75,9 @@ def run_simulations(
     bidder_configs: Mapping[str, Mapping[str, float]] | None = None,
     quality_by_group: Mapping[str, Mapping[str, float]] | None = None,
     positive_bidder_name: str | None = None,
+    mechanism: str = "efficiency-max",
+    underexposed_group: str = "female",
+    tie_break_config: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Run simulations for a list of auction methods and collect stats.
 
@@ -105,15 +85,31 @@ def run_simulations(
         n_impressions: number of user impressions to simulate
         methods: list of auction methods to simulate (default: ["first_price", "second_price", "gsp"])
         seed: random seed for reproducibility
-        valuation_fn: function to compute bidder's valuation for an ad spot
         bidder_configs: mapping bidder name -> targeting dict, used to build Bidder objects
+        valuation_fn: function to compute bidder's valuation for an ad spot
         quality_by_group: mapping group -> bidder quality scores used during allocation
         positive_bidder_name: bidder name considered a positive decision for
             statistical parity (defaults to any winning bidder)
+        tie_break_config: optional dictionary forwarded to AdSpot to control
+            tie-breaking probabilities between bidders
 
     Returns a dictionary mapping method -> stats, where stats contains per-gender counts,
     per-bidder spends, average prices, share metrics, fairness metrics, and total utility.
     """
+    def quality_fn(adspot: AdSpot, bidder_list: List[Bidder]) -> List[float]:
+        group = adspot.tags[0] if adspot.tags else None
+        group_scores = quality_by_group.get(group, {})
+        return [group_scores.get(b.name, 1.0) for b in bidder_list]
+    
+    def quality_fn_bidder_specific(adspot: AdSpot, bidder:Bidder) -> List[float]:
+        quality_bidder = {}
+        for group in quality_by_group:
+            group_scores = quality_by_group.get(group, {})
+            quality_bidder[group] = group_scores.get(bidder.name, 1.0)
+        return quality_bidder
+    
+    
+
     if methods is None:
         methods = ["first_price", "second_price", "gsp"]
 
@@ -142,14 +138,11 @@ def run_simulations(
         prices_list = []
         impression_log: List[Dict[str, Any]] = []
 
-        def quality_fn(adspot: AdSpot, bidder_list: List[Bidder]) -> List[float]:
-            group = adspot.tags[0] if adspot.tags else None
-            group_scores = quality_by_group.get(group, {})
-            return [group_scores.get(b.name, 1.0) for b in bidder_list]
+
 
         for _ in range(n_impressions):
             gender = random.choice(["male", "female"])  # 50/50 distribution
-            spot = AdSpot(1, [gender])
+            spot = AdSpot(1, [gender], mechanism=mechanism, tie_break_config=tie_break_config)
             res = platform.assign(
                 [spot],
                 method=method,
@@ -184,10 +177,10 @@ def run_simulations(
             "avg_price": sum(prices_list) / len(prices_list) if prices_list else 0.0,
             "n_impressions": n_impressions,
         }
-        summary["statistical_parity"] = calculate_statistical_parity(
-            impression_log, positive_bidder_name=positive_bidder_name
+        quality_stem = quality_fn_bidder_specific(spot, bidder=Bidder("STEM", {}))
+        summary["fairness_metrics"] = calculate_fairness_metrics(
+            impression_log, positive_bidder_name=positive_bidder_name, quality_stem=quality_stem
         )
-        summary["equality_of_opportunity"] = calculate_equality_of_opportunity(impression_log)
         summary["total_utility"] = calculate_total_utility(impression_log)
         # compute per-gender shares for each bidder
         shares = {"male": {}, "female": {}}
@@ -216,24 +209,39 @@ def print_summary(results: Dict[str, Any]):
             for name, cnt in stats["counts"][gender].most_common():
                 share = stats["shares"][gender].get(name, 0.0)
                 print(f"  {name}: {cnt} ({share:.2%})")
-
-        parity = stats.get("statistical_parity")
-        if parity:
-            pos_bidder = parity.get("positive_bidder")
+        print("---------------------------")
+        print("---------------------------")
+        print("---------------------------")
+        print("---------------------------")
+        print("Fairness metrics:")
+        fairness_metrics = stats.get("fairness_metrics")
+        if fairness_metrics:
+            pos_bidder = fairness_metrics.get("positive_bidder")
             if pos_bidder:
                 print(f"Statistical parity (share receiving {pos_bidder}):")
             else:
                 print("Statistical parity (positive decision rate):")
-            for group, rate in parity["per_group"].items():
+            for group, rate in fairness_metrics["per_group"].items():
                 print(f"  {group}: {rate:.2%}")
-            print(f"  Max gap: {parity['max_gap']:.2%}")
-
-        opportunity = stats.get("equality_of_opportunity")
+            print(f"  Max gap: {fairness_metrics['max_gap']:.2%}")
+        print("---------------------------")
+        print("---------------------------")
+        opportunity = fairness_metrics.get("adjusted_rates") if fairness_metrics else None
         if opportunity:
-            print("Equality of opportunity (expected clicks captured):")
-            for group, rate in opportunity["per_group"].items():
-                print(f"  {group}: {rate:.2%}")
-            print(f"  Max gap: {opportunity['max_gap']:.2%}")
+            print("Equality of Opportunity (adjusted rates):")
+            # print male and female adjusted
+            for group, rate in opportunity.items():
+                if group == 'female_adjusted':
+                    print(f"  {group}: {rate:.2%}")
+                if group == 'female':
+                    print(f"  {group}: {rate:.2%}")
+            # check if EQ is respected 
+            if opportunity['max_gap'] <= 0.05:
+                print(f"  Max gap: {opportunity['max_gap']:.2%} (EQ respected)")
+            else:
+                print(f"  Max gap: {opportunity['max_gap']:.2%} (EQ NOT respected)")
+        print("---------------------------")
+        print("---------------------------")
 
         if "total_utility" in stats:
             print(f"Total platform utility (revenue): {stats['total_utility']:.2f}")
@@ -264,7 +272,7 @@ def try_plot(results, out_prefix: str | None = None):
             ax.set_xticks([p + width * (len(data) - 1) / 2 for p in x])
             ax.set_xticklabels(genders)
             ax.set_ylabel('Share of wins')
-            ax.set_title(f'Share by bidder and gender ({method})')
+            ax.set_title(f'{out_prefix}')
             ax.legend()
 
             plt.show()
